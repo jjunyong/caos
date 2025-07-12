@@ -154,6 +154,11 @@ signal() {
 }
 ```
 
+**문제점: Busy Wait**
+
+- 자원이 없을 때 프로세스가 무한루프를 돌며 CPU 낭비
+- 대기 중인 프로세스가 계속 CPU를 점유하여 비효율적
+
 #### 세마포 개선 코드 (Busy Wait 문제 해결)
 
 ```c
@@ -174,6 +179,43 @@ signal() {
 }
 ```
 
+**개선 이유:**
+
+- 자원이 없을 때 프로세스를 대기 큐에 보내고 sleep 상태로 전환
+- CPU를 다른 프로세스가 사용할 수 있어 효율성 향상
+- 자원이 반납되면 대기 중인 프로세스만 선택적으로 깨움
+
+#### 기존 vs 개선된 세마포의 S 값 해석
+
+**기존 세마포 (Busy Wait):**
+
+- **S**: 단순히 사용 가능한 자원의 개수
+- **S > 0**: 자원 있음, 즉시 사용 가능
+- **S = 0**: 자원 없음, busy wait으로 대기
+
+**개선된 세마포:**
+
+- **S > 0**: 사용 가능한 자원의 개수
+- **S = 0**: 자원 없음, 대기 프로세스 없음
+- **S < 0**: 자원 없음 + **|S| = 대기 중인 프로세스 개수**
+
+**예시: 자원 2개인 세마포**
+
+```
+초기: S = 2
+P1 wait(): S = 1 (자원 1개 사용)
+P2 wait(): S = 0 (자원 2개 모두 사용)
+P3 wait(): S = -1 (자원 없어서 대기, 대기 프로세스 1개)
+P4 wait(): S = -2 (대기 프로세스 2개)
+P1 signal(): S = -1 (P3 깨움, 아직 P4는 대기 중)
+P2 signal(): S = 0 (P4 깨움, 모든 대기 해소)
+```
+
+**signal()에서 if (S <= 0)인 이유:**
+
+- S를 증가시켰는데도 S ≤ 0이면 아직 대기 중인 프로세스가 있다는 의미
+- 반납된 자원을 대기 중인 프로세스에게 즉시 할당해야 함
+
 ### Busy Wait 문제와 해결책
 
 #### 문제점
@@ -192,27 +234,44 @@ signal() {
 
 ### 세마포를 이용한 프로세스 실행 순서 제어
 
+세마포를 이용하면 프로세스들이 특정 순서로 실행되도록 강제할 수 있다.
+
+#### 기본 원리
+
 세마포 변수 S를 0으로 설정하고, 순서를 제어하고 싶은 프로세스에 다음과 같이 적용:
 
 - **먼저 실행할 프로세스** 뒤에 `signal()` 함수
 - **나중에 실행할 프로세스** 앞에 `wait()` 함수
 
-#### 실행 순서 제어 예시 (P1 → P2)
+#### 동작 과정 분석 (P1 → P2 순서)
 
 ```c
 // 세마포 변수
-int S = 0;
+int S = 0;  // 초기값이 핵심!
 
-// P1 프로세스
+// P1 프로세스 (먼저 실행되어야 할 프로세스)
 P1의 코드 실행
-signal();  // S를 1 증가
+signal(S);     // S를 0 → 1로 증가, "P2야 이제 실행해도 돼"
 
-// P2 프로세스
-wait();    // S가 0이면 대기, 1이면 진입 후 S 감소
+// P2 프로세스 (나중에 실행되어야 할 프로세스)
+wait(S);       // S가 0이면 대기, 1이면 통과 후 S를 1 → 0으로 감소
 P2의 코드 실행
 ```
 
-**결과**: P1이 먼저 실행되든 P2가 먼저 실행되든 **반드시 P1 → P2 순서**로 실행됨
+**Case 1: P1이 먼저 실행되는 경우**
+
+1. P1 실행 → signal(S) 호출 → S = 1
+2. P2 실행 → wait(S) 호출 → S ≥ 1이므로 즉시 통과, S = 0
+3. 결과: P1 → P2 순서
+
+**Case 2: P2가 먼저 실행되는 경우**
+
+1. P2 실행 → wait(S) 호출 → S = 0이므로 **대기 상태**로 전환
+2. P1 실행 → signal(S) 호출 → 대기 중인 P2를 깨움
+3. P2가 다시 실행
+4. 결과: P1 → P2 순서 (P2가 먼저 시작했지만 P1을 기다림!)
+
+**핵심**: 세마포 초기값 0과 wait/signal의 적절한 배치로 실행 순서를 강제할 수 있다.
 
 ---
 
@@ -253,48 +312,79 @@ monitor BankAccount {
 - 프로세스는 **반드시 인터페이스를 통해서만** 공유 자원에 접근
 - 모니터 안에 **항상 하나의 프로세스만** 들어올 수 있어 **상호배제 자동 보장**
 
-### 조건 변수 (Condition Variable)
+### 모니터의 상호배제 메커니즘
+
+모니터는 언어 차원에서 제공되는 기능으로, 내부적으로 뮤텍스를 사용하여 상호배제를 자동으로 보장한다.
+
+```c
+// 모니터가 내부적으로 수행하는 작업 (개발자에게는 숨겨짐)
+monitor BankAccount {
+    private Lock monitor_lock;        // 자동 생성
+    private Queue entry_queue;        // 자동 생성
+
+    withdraw(int amount) {
+        monitor_lock.acquire();       // 자동 실행
+        try {
+            balance -= amount;        // 개발자가 작성한 코드
+        } finally {
+            monitor_lock.release();   // 자동 실행
+        }
+    }
+}
+```
+
+**동작 과정:**
+
+1. 프로세스 A가 withdraw 호출 → 모니터 진입 → 자동으로 락 획득
+2. 프로세스 B가 동시에 deposit 호출 시도 → 모니터가 사용 중임을 감지 → 진입 큐에서 대기
+3. 프로세스 A 완료 → 자동으로 락 해제 → 프로세스 B를 깨워서 진입 허용
+
+### 조건 변수를 통한 실행 순서 제어
 
 조건 변수는 **프로세스 실행 순서를 제어**하기 위한 특별한 변수다.
 
-#### 조건 변수가 필요한 상황: 은행 계좌 예시
+#### 은행 계좌 완전한 예시
 
 ```c
 monitor BankAccount {
     int balance = 1000;
-    condition sufficient_funds;  // 조건 변수
+    condition sufficient_funds;  // 조건 변수: "잔액이 충분함"
 
     withdraw(int amount) {
         // 상호배제는 자동 보장됨
-
         while (balance < amount) {
             wait(sufficient_funds);  // "입금 후에 나를 실행해줘"
         }
         balance -= amount;
-        console.log("출금 완료");
+        console.log("출금 완료: " + amount);
     }
 
     deposit(int amount) {
         balance += amount;
         signal(sufficient_funds);   // "이제 출금 프로세스 실행해도 돼"
-        console.log("입금 완료");
+        console.log("입금 완료: " + amount);
     }
 }
 ```
 
-**실행 순서**: 잔액이 부족하면 **입금 → 출금** 순서로 실행
+**실행 순서 제어 과정:**
+
+1. 출금 프로세스가 withdraw(500) 호출, 잔액 1000원 → 충분하므로 즉시 실행
+2. 또 다른 출금 프로세스가 withdraw(800) 호출, 잔액 500원 → 부족하므로 wait() 호출로 대기
+3. 입금 프로세스가 deposit(400) 호출 → signal() 호출로 대기 중인 출금 프로세스 깨움
+4. 대기 중이던 출금 프로세스가 다시 실행
 
 #### 조건 변수의 연산
 
 **wait 연산**
 
-- "아직 내가 실행될 때가 아니야, 기다릴게"
+- "아직 내가 실행될 조건이 안 돼, 기다릴게"
 - 프로세스를 조건 변수 대기 큐에 삽입
 - 모니터가 비게 되어 다른 프로세스 진입 가능
 
 **signal 연산**
 
-- "이제 기다리던 프로세스 실행해도 돼"
+- "이제 기다리던 프로세스 실행 조건이 만족됐어"
 - 조건 변수 대기 큐의 프로세스를 깨움
 - 깨어난 프로세스가 모니터로 다시 진입
 
@@ -302,3 +392,136 @@ monitor BankAccount {
 
 1. **상호배제**: 모니터 자체가 자동으로 한 번에 하나의 프로세스만 허용
 2. **실행 순서 제어**: 조건 변수를 통해 "누가 먼저, 누가 나중에 실행될지" 결정
+
+---
+
+## 실무에서의 동기화 (Spring Boot 백엔드 관점)
+
+### 프레임워크가 자동으로 보장해주는 경우
+
+#### 1. 데이터베이스 트랜잭션
+
+```java
+@Transactional  // Spring이 자동으로 동기화 보장!
+public void transferMoney(Long fromId, Long toId, BigDecimal amount) {
+    Account from = accountRepository.findById(fromId);
+    Account to = accountRepository.findById(toId);
+
+    from.withdraw(amount);  // DB 레벨에서 동기화됨
+    to.deposit(amount);     // Race Condition 걱정 없음
+}
+```
+
+**DB가 자동으로 제공하는 것:**
+
+- ACID 트랜잭션으로 원자성 보장
+- 락(Lock) 자동 관리
+- 트랜잭션 격리 수준 보장
+- 데드락 감지 및 해결
+
+#### 2. HTTP Request별 격리
+
+```java
+@RestController
+public class UserController {
+
+    @GetMapping("/users/{id}")
+    public ResponseEntity<User> getUser(@PathVariable Long id) {
+        // 각 HTTP 요청마다 별도 스레드 + 별도 지역변수
+        // 자동으로 격리되어 동기화 문제 없음
+        User user = userService.findById(id);
+        return ResponseEntity.ok(user);
+    }
+}
+```
+
+#### 3. Spring Bean의 Stateless 특성
+
+```java
+@Service  // 기본적으로 싱글톤이지만 상태가 없으면 안전
+public class UserService {
+
+    @Autowired
+    private UserRepository userRepository;  // 스레드 안전
+
+    public User findUser(Long id) {
+        return userRepository.findById(id).orElse(null);  // 안전함
+    }
+}
+```
+
+### 개발자가 직접 동기화해야 하는 경우
+
+#### ❌ 위험한 코드 (Race Condition 발생)
+
+```java
+@Service
+public class CounterService {
+    private int count = 0;  // 위험! 여러 요청이 공유하는 상태
+
+    public int increment() {
+        return ++count;  // Race Condition 발생 가능
+    }
+}
+```
+
+#### ✅ 안전한 코드 1: synchronized 사용
+
+```java
+@Service
+public class CounterService {
+    private int count = 0;
+
+    public synchronized int increment() {  // 모니터 개념 적용
+        return ++count;  // 상호배제 자동 보장
+    }
+}
+```
+
+#### ✅ 안전한 코드 2: AtomicInteger 사용
+
+```java
+@Service
+public class CounterService {
+    private final AtomicInteger count = new AtomicInteger(0);
+
+    public int increment() {
+        return count.incrementAndGet();  // 원자적 연산으로 안전
+    }
+}
+```
+
+#### ✅ 안전한 코드 3: Lock 명시적 사용
+
+```java
+@Service
+public class CounterService {
+    private int count = 0;
+    private final ReentrantLock lock = new ReentrantLock();
+
+    public int increment() {
+        lock.lock();    // 세마포/뮤텍스 개념 적용
+        try {
+            return ++count;
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+```
+
+### 실무 가이드라인
+
+**✅ 자동으로 안전한 경우:**
+
+- **@Transactional** 메서드 내 DB 작업
+- **Request Scope** 변수들 (Controller의 지역변수 등)
+- **Stateless 서비스** (상태를 갖지 않는 Service)
+- **메시지 큐** 처리 (@RabbitListener, @KafkaListener 등)
+
+**⚠️ 주의가 필요한 경우:**
+
+- **Singleton Bean에서 인스턴스 변수 사용**
+- **캐시 구현** (HashMap, List 등의 공유 자료구조)
+- **카운터, 통계 수집** 등의 상태 관리
+- **외부 API 호출 제한** (Rate Limiting)
